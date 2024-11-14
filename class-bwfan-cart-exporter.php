@@ -1,134 +1,200 @@
 <?php
+// working cart code . 
 namespace BWFAN\Exporter;
 
 use BWFAN\Exporter\Base;
 
 if (!defined('ABSPATH')) {
-	exit; // Exit if accessed directly
+    exit; // Exit if accessed directly
 }
 
-class Cart extends Base
-{
-	public $export_id = 0;
+class Cart extends Base {
+    public $export_id = 0;
+    private $user_id = 0;
+    private $current_pos = 0;
+    private $batch_limit = 10;
+    private $db_export_row = [];
+    private $start_time = 0;
+    private $export_meta = [];
+    private $halt = 0;
 
-	public function __construct()
-	{
-		$this->type = 'cart';
-	}
+    public function __construct() {
+        $this->type = 'cart';
+    }
 
-	/**
-	 * Handle cart export
-	 *
-	 * @param $user_id
-	 * @param $export_id
-	 *
-	 * @return void
-	 */
-	public function handle_export($user_id, $export_id = 0)
-	{
-		$this->export_id = $export_id;
+    public function maybe_insert_data_in_table() {
+        error_log("Starting maybe_insert_data_in_table");
 
-		// Default status in case of failure
-		$status_data = [
-			'status' => 3,
-			'msg' => [
-				__('Unable to create cart export file.', 'wp-marketing-automations-pro')
-			]
-		];
+        // Check if export directory exists
+        if (!file_exists(BWFCRM_EXPORT_DIR)) {
+            $result = wp_mkdir_p(BWFCRM_EXPORT_DIR);
+            if (!$result) {
+                error_log("Failed to create export directory at " . BWFCRM_EXPORT_DIR);
+                return 0;
+            }
+        }
 
-		// Ensure necessary class and data are available
-		if (!class_exists('\BWFAN_Recoverable_Carts')) {
-			$status_data['msg'][] = __('Missing BWFAN_Recoverable_Carts class.', 'wp-marketing-automations-pro');
-		} else {
-			// Fetch abandoned carts data
-			$carts = \BWFAN_Recoverable_Carts::get_abandoned_carts(
-				'',
-				'',
-				0,
-				100,
-				'',
-				false
-			);
+        $file_name = 'cart-export-' . time() . '.csv';
+        $file_path = BWFCRM_EXPORT_DIR . '/' . $file_name;
+        error_log("Export file path: $file_path");
 
-			// Prepare CSV filename and path
-			$filename = 'cart-export-' . time() . '.csv';
-			if (!file_exists(self::$export_folder)) {
-				wp_mkdir_p(self::$export_folder);
-			}
-			$file_path = self::$export_folder . '/' . $filename;
+        // Create CSV file with headers
+        $file = fopen($file_path, "w");
+        if (!$file) {
+            error_log("Failed to create export file at $file_path");
+            return 0;
+        }
+        $headers = ['email', 'user_id', 'created_time', 'items', 'total', 'currency', 'checkout_data', 'checkout_page_id'];
+        fputcsv($file, $headers);
+        fclose($file);
 
-			// Open file for writing
-			$file = fopen($file_path, 'w');
-			if ($file) {
-				// Define headers
-				$headers = ['email', 'user_id', 'created_time', 'items', 'total', 'currency', 'checkout_data', 'checkout_page_id'];
-				fputcsv($file, $headers);
+        // Insert data into export table
+        $count = \BWFAN_Recoverable_Carts::get_abandoned_carts('', '', '', '', '', true)['total_count'];
+        error_log("Total carts count for export: $count");
 
-				// Write cart data to CSV
+        $data = [
+            'offset' => 0,
+            'type' => 2,
+            'status' => 1,
+            'count' => $count,
+            'meta' => wp_json_encode(['title' => 'cart', 'file' => $file_name]),
+            'created_date' => current_time('mysql', 1),
+            'last_modified' => current_time('mysql', 1)
+        ];
+        \BWFAN_Model_Import_Export::insert($data);
+        $this->export_id = \BWFAN_Model_Import_Export::insert_id();
+        error_log("Generated export ID: {$this->export_id}");
 
-				foreach ($carts as $cart) {
-					if (!is_object($cart)) {
-						continue;
-					}
+        // Retrieve and store full row for export_meta
+        $this->db_export_row = \BWFAN_Model_Import_Export::get($this->export_id);
+        $this->export_meta = json_decode($this->db_export_row['meta'], true);
 
-					$row_data = [
-						$this->sanitize_field($cart->email),
-						$this->sanitize_field($cart->user_id),
-						$this->sanitize_field($cart->created_time),
-						$this->sanitize_field($cart->items),
-						$this->sanitize_field($cart->total),
-						$this->sanitize_field($cart->currency),
-						$this->sanitize_field($cart->checkout_data),
-						$this->sanitize_field($cart->checkout_page_id)
-					];
+        error_log("Export meta after insertion: " . print_r($this->export_meta, true));
 
-					fputcsv($file, $row_data);
-				}
+        return $this->export_id;
+    }
 
-				fclose($file);
+    public function handle_export($user_id, $export_id = 0) {
+        error_log("Starting handle_export for user_id: $user_id and export_id: $export_id");
+        $this->export_id = $export_id;
+        $this->user_id = $user_id;
 
-				// Update status data on success
-				$status_data = [
-					'status' => 2,
-					'url' => $file_path,
-					'msg' => [
-						__('Cart export file created successfully', 'wp-marketing-automations-pro')
-					]
-				];
-			} else {
-				$status_data['msg'][] = __('Failed to open export file for writing.', 'wp-marketing-automations-pro');
-			}
+        // Fetch export data row and decode meta
+		if ( is_array( $this->db_export_row ) && ! empty( $this->db_export_row ) && absint( $this->db_export_row['id'] ) === absint( $export_id ) ) {
+			return;
 		}
+         
+        $this->db_export_row = \BWFAN_Model_Import_Export::get($this->export_id);
+        $this->export_meta = !empty($this->db_export_row['meta']) ? json_decode($this->db_export_row['meta'], true) : [];
 
-		// Update user meta with export status
-		$user_data = get_user_meta($user_id, 'bwfan_single_export_status', true);
-		$user_data[$this->type] = $status_data;
-		update_user_meta($user_id, 'bwfan_single_export_status', $user_data);
+        error_log("Fetched db_export_row: " . print_r($this->db_export_row, true));
+        error_log("Decoded export_meta: " . print_r($this->export_meta, true));
 
-		// Unschedule the export action
-		BWFAN_Core()->exporter->unschedule_export_action([
-			'type' => $this->type,
-			'user_id' => $user_id,
-			'export_id' => $this->export_id
-		]);
-	}
+        if (empty($this->export_meta['file'])) {
+            error_log("File name missing in export_meta.");
+            return;
+        }
 
-	/**
-	 * Sanitize field for CSV
-	 *
-	 * @param $field
-	 *
-	 * @return string
-	 */
-	private function sanitize_field($field)
-	{
-		if (is_null($field))
-			return 'N/A';
-		if (is_array($field) || is_object($field)) {
-			return wp_json_encode($field);
-		}
-		return sanitize_text_field($field);
-	}
+        $file_path = BWFCRM_EXPORT_DIR . '/' . $this->export_meta['file'];
+        $this->current_pos = absint($this->db_export_row['offset']);
+        error_log("File path for export: $file_path");
+        error_log("Starting position (offset) for export: {$this->current_pos}");
+
+        $this->start_time = time();
+        do {
+
+            $carts = \BWFAN_Recoverable_Carts::get_abandoned_carts('', '', $this->current_pos, $this->batch_limit, '', false);
+            error_log("Fetched batch of carts: " . print_r($carts, true));
+
+            if (empty($carts)) {
+                error_log("No more carts to export. Ending export.");
+                $this->end_export(2, 'Export completed - no more carts');
+                return;
+            }
+
+            $this->export_to_csv($file_path, $carts);
+            $this->current_pos += count($carts);
+
+            $this->update_offset();
+            error_log("Updated offset position: {$this->current_pos}");
+
+            if ($this->get_percent_completed() >= 100) {
+                error_log("Export completed at 100%");
+                $this->end_export(2, 'Export completed successfully');
+                return;
+            }
+
+        } while ((time() - $this->start_time) < 30 && !\BWFCRM_Common::memory_exceeded() && $this->halt === 0);
+    }
+
+    private function export_to_csv($file_path, $carts) {
+        error_log("Writing to CSV file at: $file_path");
+
+        $file = fopen($file_path, "a");
+        if (!$file) {
+            error_log("Failed to open file for writing: $file_path");
+            return;
+        }
+
+        foreach ($carts as $cart) {
+            if (!is_object($cart)) {
+                error_log("Invalid cart data encountered; skipping entry.");
+                continue;
+            }
+
+            $row_data = [
+                $this->sanitize_field($cart->email ?? ''),
+                $this->sanitize_field($cart->user_id ?? ''),
+                $this->sanitize_field($cart->created_time ?? ''),
+                $this->sanitize_field($cart->items ?? ''),
+                $this->sanitize_field($cart->total ?? ''),
+                $this->sanitize_field($cart->currency ?? ''),
+                $this->sanitize_field($cart->checkout_data ?? ''),
+                $this->sanitize_field($cart->checkout_page_id ?? '')
+            ];
+
+            fputcsv($file, $row_data);
+        }
+
+        fclose($file);
+        error_log("Finished writing batch to CSV.");
+    }
+
+    private function update_offset() {
+        \BWFAN_Model_Import_Export::update(["offset" => $this->current_pos], ['id' => absint($this->export_id)]);
+        error_log("Offset updated in database to: {$this->current_pos}");
+    }
+
+    private function get_percent_completed() {
+        $percent = !empty($this->db_export_row['count']) ? min(round(($this->current_pos / $this->db_export_row['count']) * 100), 100) : 0;
+        error_log("Current export completion percentage: $percent%");
+        return $percent;
+    }
+
+    public function end_export($status = 3, $status_message = '') {
+        error_log("Ending export with status: $status, message: $status_message");
+
+        BWFAN_Core()->exporter->unschedule_export_action([
+            'type' => $this->type,
+            'user_id' => $this->user_id,
+            'export_id' => $this->export_id
+        ]);
+
+        if (empty($status_message) && $status === 3) {
+            $status_message = 'Cart export completed. Export ID: ' . $this->export_id;
+        }
+
+        $this->export_meta['status_msg'] = $status_message;
+        \BWFAN_Model_Import_Export::update([
+            "status" => $status,
+            "meta" => wp_json_encode($this->export_meta)
+        ], ['id' => absint($this->export_id)]);
+        error_log("Export status updated in database with message: $status_message");
+    }
+
+    private function sanitize_field($field) {
+        return is_null($field) ? 'N/A' : (is_array($field) || is_object($field) ? wp_json_encode($field) : sanitize_text_field($field));
+    }
 }
 
 // Register the Cart exporter
